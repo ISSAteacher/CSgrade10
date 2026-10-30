@@ -355,8 +355,14 @@ function DemoBackend() {
       });
       persist(); changed.emit();
     },
-    async createAccounts(list) { return list.map(r => ({ ...r, password: '(demo)', ok: true })); },
-    async resetPassword() { throw new Error('Not available in demo mode.'); },
+    async createAccounts(list) {
+      const d = load(); d.passwords = d.passwords || {};
+      const res = list.map(r => { const u = Object.values(d.users).find(x => lc(x.email) === lc(r.email)); const pw = genPassword(); if (u) d.passwords[u.uid] = { email: u.email, password: pw }; return { ...r, password: pw, ok: true }; });
+      persist(); changed.emit(); return res;
+    },
+    watchPasswords(cb) { const f = () => cb(JSON.parse(JSON.stringify(load().passwords || {}))); f(); return changed.on(f); },
+    async storePassword(uid, email, pw) { const d = load(); d.passwords = d.passwords || {}; d.passwords[uid] = { email, password: pw }; persist(); changed.emit(); },
+    async setPassword(u, oldPw, newPw) { await this.storePassword(u.uid, u.email, newPw); },
   };
 }
 
@@ -458,13 +464,28 @@ function FirebaseBackend() {
         try {
           const cred = await A.createUserWithEmailAndPassword(sauth, r.email.trim(), pw);
           await F.setDoc(F.doc(db, 'users', cred.user.uid), { email: lc(r.email), name: r.name, cls: r.cls }, { merge: true });
+          await F.setDoc(F.doc(db, 'passwords', cred.user.uid), { email: lc(r.email), password: pw, updated: F.serverTimestamp() });
           out.push({ ...r, password: pw, ok: true });
           await A.signOut(sauth);
         } catch (e) { out.push({ ...r, password: '', ok: false, error: e.code || e.message }); }
       }
       return out;
     },
-    async resetPassword(email) { await A.sendPasswordResetEmail(auth, email); },
+    watchPasswords(cb) {
+      return F.onSnapshot(F.collection(db, 'passwords'), qs => { const o = {}; qs.forEach(d => o[d.id] = d.data()); cb(o); }, e => { console.warn(e); cb({}); });
+    },
+    async storePassword(uid, email, pw) { await F.setDoc(F.doc(db, 'passwords', uid), { email: lc(email), password: pw, updated: F.serverTimestamp() }); },
+    // the teacher changes a student's password: sign in as the student in a separate, hidden session with the stored password, then update it
+    async setPassword(u, oldPw, newPw) {
+      const sec = this._appM.initializeApp(CONFIG.firebase, 'pw-' + Date.now());
+      const sauth = A.getAuth(sec);
+      try {
+        const cred = await A.signInWithEmailAndPassword(sauth, u.email, oldPw);
+        await A.updatePassword(cred.user, newPw);
+        await A.signOut(sauth);
+      } finally { this._appM.deleteApp(sec).catch(() => {}); }
+      await this.storePassword(u.uid, u.email, newPw);
+    },
   };
 }
 
@@ -1275,17 +1296,18 @@ function renderAccount(root) {
 }
 
 // ======================================================================= teacher dashboard
-const T = { users: [], progress: {}, feedback: {}, tab: 'progress', cls: '', unsub: [] };
+const T = { users: [], progress: {}, feedback: {}, passwords: {}, showPw: false, tab: 'progress', cls: '', unsub: [] };
 
 function teacherStart() {
   T.unsub.forEach(f => f && f()); T.unsub = [];
   T.unsub.push(Backend.watchUsers(u => { T.users = u.sort((a, b) => (a.cls || '').localeCompare(b.cls || '') || (a.name || '').localeCompare(b.name || '')); teacherRefresh(); }));
   T.unsub.push(Backend.watchAllProgress(p => { T.progress = p; teacherRefresh(); }));
   T.unsub.push(Backend.watchAllFeedback(f => { T.feedback = f; teacherRefresh(); }));
+  T.unsub.push(Backend.watchPasswords(p => { T.passwords = p || {}; teacherRefresh(); }));
 }
 let _tRefreshTimer = null;
 function teacherRefresh() {
-  if (!location.hash.startsWith('#/teacher')) return;
+  if (!(location.hash.startsWith('#/teacher') || (!location.hash && S.user && S.user.isTeacher))) return;
   if (document.querySelector('.modal')) return;    // do not rebuild under an open modal
   clearTimeout(_tRefreshTimer); _tRefreshTimer = setTimeout(() => renderTeacher($('#main')), 150);
 }
@@ -1397,11 +1419,55 @@ function tStudents(w) {
         out.append(el('table', { class: 'list' }, el('tr', null, ['Name', 'Email', 'Class', 'Password', 'Status'].map(h => el('th', { text: h }))), res.map(r => el('tr', null, el('td', { text: r.name }), el('td', { text: r.email }), el('td', { text: r.cls }), el('td', { class: 'mono', text: r.password }), el('td', { text: r.ok ? 'created' : r.error === 'auth/email-already-in-use' ? 'already has an account' : r.error })))),
           el('button', { class: 'btn', type: 'button', text: 'Download passwords (CSV)', onclick: () => download('passwords.csv', csv) }));
       } })), out));
-  const tb = el('table', { class: 'list' }, el('tr', null, ['Name', 'Email', 'Class', 'Last seen', 'Now in', ''].map(h => el('th', { text: h }))));
-  usersShown().forEach(u => tb.append(el('tr', null, el('td', { text: u.name }), el('td', { text: u.email }), el('td', { text: u.cls || '' }),
-    el('td', { text: u.lastSeen ? new Date(u.lastSeen).toLocaleString() : 'never' }), el('td', { text: isOnline(u) && u.current ? 'Lesson ' + u.current : '' }),
-    el('td', null, el('button', { class: 'btn sec', type: 'button', text: 'Send password-reset e-mail', onclick: async () => { try { await Backend.resetPassword(u.email); toast('E-mail sent to ' + u.email); } catch (e) { toast(e.code || e.message); } } })))));
-  w.append(el('div', { class: 'card' }, el('h3', { text: 'Students who have logged in' }), tb));
+  // ---- student accounts and passwords (only the teacher sets passwords)
+  const tb = el('table', { class: 'list' }, el('tr', null, ['Name', 'Email', 'Class', 'Password', 'Last seen', 'Now in', ''].map(h => el('th', { text: h }))));
+  usersShown().forEach(u => {
+    const pw = T.passwords[u.uid] && T.passwords[u.uid].password;
+    tb.append(el('tr', null, el('td', { text: u.name }), el('td', { text: u.email }), el('td', { text: u.cls || '' }),
+      el('td', { class: 'mono', text: pw ? (T.showPw ? pw : '••••••••') : 'unknown' }),
+      el('td', { text: u.lastSeen ? new Date(u.lastSeen).toLocaleString() : 'never' }), el('td', { text: isOnline(u) && u.current ? 'Lesson ' + u.current : '' }),
+      el('td', null, el('button', { class: 'btn sec', type: 'button', text: 'Set new password', onclick: () => setPwDialog(u, pw) }))));
+  });
+  const csvAll = () => 'Name;Email;Class;Password\n' + usersShown().map(u => [u.name, u.email, u.cls || '', (T.passwords[u.uid] || {}).password || ''].join(';')).join('\n');
+  w.append(el('div', { class: 'card' }, el('h3', { text: 'Student accounts and passwords' }),
+    el('p', { class: 'small', html: 'Only you set and change passwords — students cannot change them on the site. If a student forgets the password, look it up here or press <b>Set new password</b>.' }),
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;margin-bottom:8px' },
+      el('button', { class: 'btn sec', type: 'button', text: T.showPw ? 'Hide passwords' : 'Show passwords', onclick: () => { T.showPw = !T.showPw; renderTeacher($('#main')); } }),
+      el('button', { class: 'btn sec', type: 'button', text: 'Download all passwords (CSV)', onclick: () => download('passwords.csv', csvAll()) })),
+    tb));
+  // import passwords created before this update (from the CSV that was downloaded then)
+  const imp = el('textarea', { rows: 4, placeholder: 'Paste lines from passwords.csv:  Name;email;class;password' });
+  w.append(el('div', { class: 'card' }, el('h3', { text: 'Password shows “unknown”?' }),
+    el('p', { class: 'small', html: 'Accounts made before this update did not store the password. Open the <b>passwords.csv</b> you downloaded when you created the accounts, copy its lines and paste them here. If the file is lost: in Firebase → Authentication → Users delete that student, then press <b>Create accounts with passwords</b> again.' }),
+    imp, el('button', { class: 'btn', type: 'button', style: 'margin-top:8px', text: 'Import passwords', onclick: async () => {
+      let n = 0;
+      for (const line of imp.value.split('\n')) {
+        const p = line.split(/[;\t]/).map(x => x.trim()); const email = (p.find(x => x.includes('@')) || '').toLowerCase(); const pw = p[3];
+        const u = T.users.find(x => lc(x.email) === email);
+        if (u && pw && pw !== 'Password') { await Backend.storePassword(u.uid, u.email, pw); n++; }
+      }
+      toast(`Imported ${n} password(s)`); imp.value = '';
+    } })));
+}
+
+function setPwDialog(u, oldPw) {
+  const inp = el('input', { type: 'text', class: 'mono' }); inp.value = genPassword();
+  const oldIn = el('input', { type: 'text', class: 'mono', placeholder: 'current password of the student' }); if (oldPw) oldIn.value = oldPw;
+  const msg = el('div', { class: 'small', style: 'min-height:1.2em;margin-top:6px' });
+  const m = el('div', { class: 'modal' }, el('div', { class: 'inner', style: 'max-width:460px;padding:22px' },
+    el('h3', { text: 'New password for ' + u.name }),
+    oldPw ? null : el('div', null, el('p', { class: 'small', text: 'The current password is not stored. Type it (from your passwords.csv):' }), oldIn),
+    el('p', { class: 'small', text: 'New password (at least 6 characters):' }), inp, msg,
+    el('div', { style: 'display:flex;gap:10px;justify-content:flex-end;margin-top:12px' },
+      el('button', { class: 'btn sec', type: 'button', text: 'Cancel', onclick: () => m.remove() }),
+      el('button', { class: 'btn', type: 'button', text: 'Save password', onclick: async (e) => {
+        if (inp.value.trim().length < 6) { msg.textContent = 'At least 6 characters.'; return; }
+        if (!oldIn.value) { msg.textContent = 'The current password is needed.'; return; }
+        e.target.disabled = true; msg.textContent = 'Saving…';
+        try { await Backend.setPassword(u, oldIn.value.trim(), inp.value.trim()); m.remove(); teacherRefresh(); toast('Password changed for ' + u.name + ': ' + inp.value.trim(), 6000); }
+        catch (err) { e.target.disabled = false; msg.textContent = /wrong-password|invalid-credential|invalid-login/.test(err.code || '') ? 'The current password is wrong. Check passwords.csv.' : 'Error: ' + (err.code || err.message); }
+      } }))));
+  document.body.append(m);
 }
 
 function tLessons(w) {
@@ -1462,7 +1528,7 @@ function renderLogin(app, errText) {
     }
     box.append(el('label', { text: 'School e-mail' }), email, el('label', { text: 'Password' }), pw,
       el('button', { class: 'btn', type: 'button', style: 'width:100%;margin-top:16px', text: 'Log in', onclick: doLogin }),
-      el('div', { class: 'small', style: 'margin-top:10px', text: 'Forgot your password? Ask your teacher to send a reset e-mail.' }));
+      el('div', { class: 'small', style: 'margin-top:10px', text: 'Forgot your password? Ask your teacher — only the teacher can give or change passwords.' }));
   }
   box.append(err);
   app.append(el('div', { class: 'login' }, box));
@@ -1478,7 +1544,7 @@ function renderShell(app) {
     el('span', { class: 'who', text: S.user.name + (S.user.isTeacher ? ' (teacher)' : '') }),
     S.user.isTeacher ? el('button', { type: 'button', text: 'Dashboard', onclick: () => go('#/teacher') }) : null,
     el('button', { type: 'button', text: S.user.isTeacher ? 'Lessons' : 'My lessons', onclick: () => go('#/home') }),
-    Backend.mode === 'firebase' ? el('button', { type: 'button', text: 'Account', onclick: () => go('#/account') }) : null,
+    Backend.mode === 'firebase' && S.user.isTeacher ? el('button', { type: 'button', text: 'Account', onclick: () => go('#/account') }) : null,
     el('button', { type: 'button', text: 'Log out', onclick: async () => { if (S.cur) await saveNow(); history.replaceState(null, '', location.pathname); Backend.logout(); } }));
   app.append(top, el('main', { id: 'main' }));
 }
@@ -1494,7 +1560,7 @@ async function route() {
   let m;
   if ((m = h.match(/^#\/lesson\/(\d+)/)) && +m[1] >= 1 && +m[1] <= 30) openLesson(+m[1], main);
   else if (h.startsWith('#/teacher') && S.user.isTeacher) renderTeacher(main);
-  else if (h.startsWith('#/account')) renderAccount(main);
+  else if (h.startsWith('#/account') && S.user.isTeacher) renderAccount(main);
   else renderHome(main);
   if (!h.startsWith('#/lesson')) Backend.heartbeat(null);
 }
