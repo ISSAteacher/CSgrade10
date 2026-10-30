@@ -262,7 +262,7 @@ const CONFIG = {
     appId: "1:906267256797:web:55e86d07468307dcbcf834"
   },
   // 2) Teacher e-mail addresses (must be the same list as in the Firestore rules).
-  teachers: ["issa2026cs@gmail.com"],
+  teachers: ["issa2026cs@gmail.com"]
   // 3) "Sign in with Microsoft" button (needs the Microsoft provider switched on in Firebase).
   microsoftLogin: false,
   microsoftTenant: "",          // your school's Microsoft tenant ID (optional)
@@ -363,6 +363,10 @@ function DemoBackend() {
     watchPasswords(cb) { const f = () => cb(JSON.parse(JSON.stringify(load().passwords || {}))); f(); return changed.on(f); },
     async storePassword(uid, email, pw) { const d = load(); d.passwords = d.passwords || {}; d.passwords[uid] = { email, password: pw }; persist(); changed.emit(); },
     async setPassword(u, oldPw, newPw) { await this.storePassword(u.uid, u.email, newPw); },
+    async deleteStudent(u) {
+      const d = load(); delete d.users[u.uid]; delete d.progress[u.uid]; delete d.feedback[u.uid]; if (d.passwords) delete d.passwords[u.uid];
+      d.roster = (d.roster || []).filter(r => lc(r.email) !== lc(u.email)); persist(); changed.emit(); return true;
+    },
   };
 }
 
@@ -485,6 +489,22 @@ function FirebaseBackend() {
         await A.signOut(sauth);
       } finally { this._appM.deleteApp(sec).catch(() => {}); }
       await this.storePassword(u.uid, u.email, newPw);
+    },
+    // delete a student: the login account (possible only when the password is known) and all their data
+    async deleteStudent(u, pw) {
+      let authDeleted = false;
+      if (pw) {
+        const sec = this._appM.initializeApp(CONFIG.firebase, 'del-' + Date.now());
+        try { const cred = await A.signInWithEmailAndPassword(A.getAuth(sec), u.email, pw); await A.deleteUser(cred.user); authDeleted = true; }
+        catch (e) { console.warn(e); }
+        finally { this._appM.deleteApp(sec).catch(() => {}); }
+      }
+      const b = F.writeBatch(db);
+      const ps = await F.getDocs(F.collection(db, 'progress', u.uid, 'lessons')); ps.forEach(x => b.delete(x.ref));
+      const fs = await F.getDocs(F.collection(db, 'feedback', u.uid, 'items')); fs.forEach(x => b.delete(x.ref));
+      b.delete(F.doc(db, 'users', u.uid)); b.delete(F.doc(db, 'passwords', u.uid)); b.delete(F.doc(db, 'roster', lc(u.email)));
+      await b.commit();
+      return authDeleted;
     },
   };
 }
@@ -1426,7 +1446,8 @@ function tStudents(w) {
     tb.append(el('tr', null, el('td', { text: u.name }), el('td', { text: u.email }), el('td', { text: u.cls || '' }),
       el('td', { class: 'mono', text: pw ? (T.showPw ? pw : '••••••••') : 'unknown' }),
       el('td', { text: u.lastSeen ? new Date(u.lastSeen).toLocaleString() : 'never' }), el('td', { text: isOnline(u) && u.current ? 'Lesson ' + u.current : '' }),
-      el('td', null, el('button', { class: 'btn sec', type: 'button', text: 'Set new password', onclick: () => setPwDialog(u, pw) }))));
+      el('td', { style: 'white-space:nowrap' }, el('button', { class: 'btn sec', type: 'button', text: 'Set new password', onclick: () => setPwDialog(u, pw) }), ' ',
+        el('button', { class: 'btn warn', type: 'button', text: 'Delete', onclick: () => deleteStudentDialog(u, pw) }))));
   });
   const csvAll = () => 'Name;Email;Class;Password\n' + usersShown().map(u => [u.name, u.email, u.cls || '', (T.passwords[u.uid] || {}).password || ''].join(';')).join('\n');
   w.append(el('div', { class: 'card' }, el('h3', { text: 'Student accounts and passwords' }),
@@ -1448,6 +1469,16 @@ function tStudents(w) {
       }
       toast(`Imported ${n} password(s)`); imp.value = '';
     } })));
+}
+
+async function deleteStudentDialog(u, pw) {
+  if (!(await confirmBox(`Delete <b>${esc(u.name)}</b> (${esc(u.email)})?<br><br>All their answers, progress and feedback will be deleted. This cannot be undone.`, 'Delete', 'Cancel'))) return;
+  try {
+    const authDeleted = await Backend.deleteStudent(u, pw);
+    teacherRefresh();
+    if (authDeleted || Backend.mode === 'demo') toast(u.name + ' deleted');
+    else await confirmBox(`${esc(u.name)} was removed from the course list, but the <b>login account still exists</b> (the site does not know the password).<br><br>To remove it completely: Firebase → Security → Authentication → Users → find <b>${esc(u.email)}</b> → ⋮ → <b>Delete account</b>. Then you can create the account again.`, 'OK', 'Close');
+  } catch (e) { toast('Error: ' + (e.code || e.message)); }
 }
 
 function setPwDialog(u, oldPw) {
