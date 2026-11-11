@@ -71,6 +71,9 @@ textarea:disabled,input:disabled,select:disabled{background:#f4f6fa;color:#334}
 .tile .pb i{display:block;height:100%;background:var(--teal)}
 .tile .st{font-size:.8rem;margin-top:6px;color:var(--muted)}
 .tile.done{border-left-color:var(--green)}
+.tile.locked{opacity:.55;border-left-color:#c7cfdd;background:#f3f5f9;cursor:not-allowed}
+.lockcard{text-align:center;padding:40px 20px}.lockcard .lockico{font-size:56px}
+.acc-sel{max-width:230px}
 .tile.prog{border-left-color:var(--orange)}
 .tile.missed{border-left-color:var(--red);background:#fffafa}
 .tile.fa{background:linear-gradient(0deg,#fff,#fff),var(--purple-l)}
@@ -262,7 +265,7 @@ const CONFIG = {
     appId: "1:906267256797:web:55e86d07468307dcbcf834"
   },
   // 2) Teacher e-mail addresses (must be the same list as in the Firestore rules).
-  teachers: ["issa2026cs@gmail.com"],
+  teachers: ["teacher@school.kz"],
   // 3) "Sign in with Microsoft" button (needs the Microsoft provider switched on in Firebase).
   microsoftLogin: false,
   microsoftTenant: "",          // your school's Microsoft tenant ID (optional)
@@ -347,7 +350,7 @@ function DemoBackend() {
     async teacherPatchProgress(uid, n, patch) { const d = load(); d.progress[uid] = d.progress[uid] || {}; d.progress[uid][n] = { ...(d.progress[uid][n] || { n }), ...patch }; persist(); changed.emit(); },
     async getRoster() { return load().roster.slice(); },
     async saveRoster(list) {
-      const d = load(); d.roster = list;
+      const d = load(); d.roster = list.map(r => ({ name: r.name, email: r.email, cls: r.cls }));
       list.forEach((r, i) => {
         const exists = Object.values(d.users).find(u => lc(u.email) === lc(r.email));
         if (exists) { exists.name = r.name; exists.cls = r.cls; }
@@ -357,7 +360,7 @@ function DemoBackend() {
     },
     async createAccounts(list) {
       const d = load(); d.passwords = d.passwords || {};
-      const res = list.map(r => { const u = Object.values(d.users).find(x => lc(x.email) === lc(r.email)); const pw = genPassword(); if (u) d.passwords[u.uid] = { email: u.email, password: pw }; return { ...r, password: pw, ok: true }; });
+      const res = list.map(r => { const u = Object.values(d.users).find(x => lc(x.email) === lc(r.email)); const pw = r.password || genPassword(); if (u) d.passwords[u.uid] = { email: u.email, password: pw }; return { ...r, password: pw, ok: true }; });
       persist(); changed.emit(); return res;
     },
     watchPasswords(cb) { const f = () => cb(JSON.parse(JSON.stringify(load().passwords || {}))); f(); return changed.on(f); },
@@ -456,7 +459,7 @@ function FirebaseBackend() {
     async getRoster() { const qs = await F.getDocs(F.collection(db, 'roster')); const l = []; qs.forEach(d => l.push({ email: d.id, ...d.data() })); return l; },
     async saveRoster(list) {
       const b = F.writeBatch(db);
-      list.forEach(r => b.set(F.doc(db, 'roster', lc(r.email)), { name: r.name, cls: r.cls }));
+      list.forEach(r => b.set(F.doc(db, 'roster', lc(r.email)), { name: r.name, cls: r.cls || '' }));
       await b.commit();
     },
     async createAccounts(list) {
@@ -464,7 +467,7 @@ function FirebaseBackend() {
       const sauth = A.getAuth(sec);
       const out = [];
       for (const r of list) {
-        const pw = genPassword();
+        const pw = r.password || genPassword();
         try {
           const cred = await A.createUserWithEmailAndPassword(sauth, r.email.trim(), pw);
           await F.setDoc(F.doc(db, 'users', cred.user.uid), { email: lc(r.email), name: r.name, cls: r.cls }, { merge: true });
@@ -674,9 +677,22 @@ const S = {
 };
 const dateOf = n => (S.config.schedule && S.config.schedule[n]) || LES(n).date;
 const isClosed = n => (S.config.closed || []).map(String).includes(String(n));
+// lesson access: 'auto' = opens on its date, 'open' = open now, 'locked' = hidden until the teacher opens it
+const accessOf = n => { const a = S.config.access || {}; return a[String(n)] || 'auto'; };
+const isLocked = n => !(S.user && S.user.isTeacher) && (accessOf(n) === 'locked' || (accessOf(n) === 'auto' && dateOf(n) > todayISO()));
+const lockText = n => accessOf(n) === 'locked' ? 'Locked — your teacher will open it' : 'Opens ' + fmtDate(dateOf(n));
+function accessPatch(sched, access) {
+  const openAt = {};
+  COURSE.course.forEach(L => {
+    const a = access[String(L.n)] || 'auto', d = sched[L.n] || sched[String(L.n)] || LES(L.n).date;
+    openAt[String(L.n)] = a === 'open' ? new Date(0) : a === 'locked' ? new Date('2100-01-01T00:00:00') : new Date(d + 'T00:00:00');
+  });
+  return { access, openAt };
+}
 
 function statusOf(n, doc) {
   doc = doc || {};
+  if (isLocked(n)) return { key: 'locked', pct: 0, label: '🔒 ' + lockText(n) };
   const pct = doc.pct || 0, fin = !!(doc.done || doc.submitted);
   const past = dateOf(n) < todayISO();
   if (fin) return { key: 'done', pct, label: LES(n).kind === 'fa' ? 'Submitted' : 'Finished' };
@@ -1249,6 +1265,14 @@ function renderSA(L, root) {
 
 function openLesson(n, root, opts = {}) {
   const L = LES(n);
+  if (!opts.doc && isLocked(n)) {
+    S.cur = null; root.innerHTML = '';
+    root.append(el('div', { class: 'wrap' }, el('div', { class: 'card lockcard' },
+      el('div', { class: 'lockico', text: '🔒' }), el('h2', { text: `Lesson ${n} · ${L.title}` }),
+      el('p', { text: accessOf(n) === 'locked' ? 'This lesson is not open yet. Your teacher will open it in class.' : `This lesson opens on ${fmtDate(dateOf(n))}.` }),
+      el('button', { class: 'btn', type: 'button', text: '← Back to my lessons', onclick: () => go('#/home') }))));
+    window.scrollTo(0, 0); return;
+  }
   S.cur = newSession(n, opts.doc || S.progress[n], opts);
   root.innerHTML = '';
   const wrap = el('div', { class: 'wrap' }); root.append(wrap);
@@ -1284,7 +1308,7 @@ function renderHome(root) {
     const ls = all.filter(L => L.crit === crit && L.kind !== 'sa');
     const done = ls.filter(L => statusOf(L.n, S.progress[L.n]).key === 'done').length;
     return el('div', { class: 'card' }, el('h3', { text: label }), el('div', { class: 'small', text: `${fmtDate(dateOf(n))} · ${done} of ${ls.length} preparation lessons finished` }),
-      el('ul', null, ls.map(L => { const s2 = statusOf(L.n, S.progress[L.n]); return el('li', null, el('span', { class: 'lnk', text: `L${L.n} ${L.title}`, onclick: () => go('#/lesson/' + L.n) }), ' ', el('span', { class: 'tag ' + ({ done: 'd', missed: 'm', prog: 'f', todo: '' }[s2.key]), text: s2.key === 'done' ? '✓' : s2.key === 'missed' ? 'to do' : s2.pct ? s2.pct + '%' : '' })); })),
+      el('ul', null, ls.map(L => { const s2 = statusOf(L.n, S.progress[L.n]); return el('li', null, el('span', { class: 'lnk', text: `L${L.n} ${L.title}`, onclick: () => go('#/lesson/' + L.n) }), ' ', el('span', { class: 'tag ' + ({ done: 'd', missed: 'm', prog: 'f', todo: '' }[s2.key]), text: s2.key === 'locked' ? '🔒' : s2.key === 'done' ? '✓' : s2.key === 'missed' ? 'to do' : s2.pct ? s2.pct + '%' : '' })); })),
       el('button', { class: 'btn sec', type: 'button', text: 'Open the checklist for ' + label.split(' —')[0], onclick: () => go('#/lesson/' + n) }));
   };
   w.append(el('div', { class: 'sec', text: 'Prepare for the summative assessments' }), el('div', { class: 'prep' }, prep('B', 25, 'Summative B — Lesson 25'), prep('C', 26, 'Summative C — Lessons 26–27')));
@@ -1420,16 +1444,18 @@ function tAway(w) {
 }
 
 function tStudents(w) {
-  const ta = el('textarea', { rows: 8, placeholder: 'One student per line:  Name Surname; email@school.kz; 10A' });
+  const ta = el('textarea', { rows: 8, placeholder: 'One student per line:  Name Surname; email@school.kz; 10A; password\n(the password column is optional — leave it out and the site makes a password)' });
   const out = el('div');
-  const parse = () => ta.value.split('\n').map(l => l.split(/[;\t,]/).map(x => x.trim())).filter(p => p.length >= 2 && p[1].includes('@')).map(p => ({ name: p[0], email: lc(p[1]), cls: p[2] || '' }));
+  const parse = () => ta.value.split('\n').map(l => l.split(/[;\t,]/).map(x => x.trim())).filter(p => p.length >= 2 && p[1].includes('@')).map(p => ({ name: p[0], email: lc(p[1]), cls: p[2] || '', password: (p[3] || '').trim() }));
   Backend.getRoster().then(r => { if (r.length && !ta.value) ta.value = r.map(x => `${x.name}; ${x.email}; ${x.cls || ''}`).join('\n'); });
   w.append(el('div', { class: 'card' }, el('h3', { text: 'Class list' }),
-    el('p', { class: 'small', html: 'Paste your class list (you can copy three columns from Excel). <b>Save class list</b> connects names and classes to the students’ e-mail addresses. If you use passwords (not “Sign in with Microsoft”), press <b>Create accounts</b> once: the site makes a password for every new student — download the list and give each student their password.' }),
+    el('p', { class: 'small', html: 'Paste your class list (you can copy the columns from Excel): <b>Name; e-mail; class; password</b>. The password column is optional (at least 6 characters) — if it is empty, the site makes a password. <b>Save class list</b> connects names and classes to the students’ e-mail addresses. If you use passwords (not “Sign in with Microsoft”), press <b>Create accounts</b> once: the site makes a password for every new student — download the list and give each student their password.' }),
     ta, el('div', { style: 'display:flex;gap:10px;margin-top:10px;flex-wrap:wrap' },
       el('button', { class: 'btn', type: 'button', text: 'Save class list', onclick: async () => { const l = parse(); if (!l.length) return toast('No valid lines found'); await Backend.saveRoster(l); toast(`Saved ${l.length} students`); } }),
       el('button', { class: 'btn or', type: 'button', text: 'Create accounts with passwords', onclick: async () => {
         const l = parse(); if (!l.length) return toast('No valid lines found');
+        const short = l.filter(r => r.password && r.password.length < 6);
+        if (short.length) return toast('Passwords must have at least 6 characters: ' + short.map(r => r.name).join(', '), 6000);
         if (!(await confirmBox(`Create login accounts for <b>${l.length}</b> students? Students who already have an account are skipped.`, 'Create'))) return;
         await Backend.saveRoster(l);
         out.innerHTML = '<p><span class="spinner"></span> Creating accounts…</p>';
@@ -1503,14 +1529,24 @@ function setPwDialog(u, oldPw) {
 
 function tLessons(w) {
   const sched = { ...(S.config.schedule || {}) }; const closed = new Set((S.config.closed || []).map(String));
-  const tb = el('table', { class: 'list' }, el('tr', null, ['Lesson', 'Title', 'Date', 'Students can edit'].map(h => el('th', { text: h }))));
+  const access = { ...(S.config.access || {}) };
+  const today = todayISO();
+  const tb = el('table', { class: 'list' }, el('tr', null, ['Lesson', 'Title', 'Date', 'Access for students', 'Now', 'Students can edit'].map(h => el('th', { text: h }))));
   COURSE.course.forEach(L => {
-    const di = el('input', { type: 'date', value: dateOf(L.n), style: 'max-width:170px' }); di.onchange = () => { sched[L.n] = di.value; };
-    const cb = el('input', { type: 'checkbox' }); cb.checked = !closed.has(String(L.n)); cb.onchange = () => { cb.checked ? closed.delete(String(L.n)) : closed.add(String(L.n)); };
-    tb.append(el('tr', null, el('td', { text: `L${L.n}${L.kind === 'fa' ? ' · FA' : L.kind === 'sa' ? ' · SA' : ''}` }), el('td', { text: L.title }), el('td', null, di), el('td', null, el('label', { class: 'chk' }, cb, 'open'))));
+    const k = String(L.n);
+    const now = el('span', { class: 'small' });
+    const showNow = () => { const a = access[k] || 'auto', d = sched[L.n] || dateOf(L.n); now.textContent = a === 'locked' ? '🔒 locked' : a === 'open' ? '✓ open' : d > today ? '🔒 until ' + fmtDate(d) : '✓ open'; };
+    const di = el('input', { type: 'date', value: dateOf(L.n), style: 'max-width:170px' }); di.onchange = () => { sched[L.n] = di.value; showNow(); };
+    const sel = el('select', { class: 'acc-sel' }, [['auto', 'Opens on its date'], ['open', 'Open now'], ['locked', 'Locked until I open it']].map(([v, t]) => el('option', { value: v, text: t })));
+    sel.value = access[k] || 'auto'; sel.onchange = () => { access[k] = sel.value; showNow(); };
+    const cb = el('input', { type: 'checkbox' }); cb.checked = !closed.has(k); cb.onchange = () => { cb.checked ? closed.delete(k) : closed.add(k); };
+    showNow();
+    tb.append(el('tr', null, el('td', { text: `L${L.n}${L.kind === 'fa' ? ' · FA' : L.kind === 'sa' ? ' · SA' : ''}` }), el('td', { text: L.title }), el('td', null, di), el('td', null, sel), el('td', null, now), el('td', null, el('label', { class: 'chk' }, cb, 'open'))));
   });
-  w.append(el('div', { class: 'card' }, el('p', { class: 'small', html: 'Change a date if a lesson moves (holiday, event). Students see lessons whose date has passed as “missed” until they finish them. Untick <b>open</b> to stop students changing answers — for example, close a formative assessment after the lesson.' }),
-    el('button', { class: 'btn', type: 'button', text: 'Save dates and access', onclick: async () => { await Backend.setConfig({ schedule: sched, closed: [...closed] }); toast('Saved'); } }), tb));
+  const save = async () => { await Backend.setConfig({ schedule: sched, closed: [...closed], ...accessPatch(sched, access) }); toast('Saved — students see the change at once'); };
+  w.append(el('div', { class: 'card' }, el('p', { class: 'small', html: '<b>Access for students</b>: <i>Opens on its date</i> — the lesson is locked and appears to students on its date (default). <i>Open now</i> — open it early. <i>Locked until I open it</i> — stays hidden even after its date, until you choose <i>Open now</i>. Lessons whose date has passed stay open so students can catch up at home.<br><b>Students can edit</b>: untick to stop students changing answers (e.g. close a formative assessment after the lesson). Press <b>Save</b> after changes.' }),
+    el('button', { class: 'btn', type: 'button', text: 'Save dates and access', onclick: save }), tb,
+    el('div', { style: 'height:10px' }), el('button', { class: 'btn', type: 'button', text: 'Save dates and access', onclick: save })));
 }
 
 function tExport(w) {
@@ -1523,6 +1559,44 @@ function tExport(w) {
       el('button', { class: 'btn', type: 'button', text: 'Progress grid', onclick: () => download('progress.csv', csvProg()) }),
       el('button', { class: 'btn', type: 'button', text: 'Away log summary', onclick: () => download('away.csv', csvAway()) }),
       el('button', { class: 'btn', type: 'button', text: 'Feedback and levels', onclick: () => download('feedback.csv', csvFb()) }))));
+  // ---- answers out / feedback in (for writing feedback with an assistant)
+  const lsel = el('select', { style: 'max-width:260px' }, el('option', { value: '', text: 'All lessons' }), COURSE.course.map(L => el('option', { value: String(L.n), text: `Lesson ${L.n} · ${L.title}` })));
+  const exportAnswers = () => {
+    const only = lsel.value;
+    const students = us.map(u => {
+      const P = T.progress[u.uid] || {}; const lessons = {};
+      Object.entries(P).forEach(([n, d]) => { if (only && n !== only) return; if (!d || !d.a || !Object.keys(d.a).length) return;
+        lessons[n] = { pct: d.pct || 0, done: !!d.done, submitted: !!d.submitted, minutes: Math.round((d.time || 0) / 60), away: (d.away || {}).count || 0,
+          feedback: ((T.feedback[u.uid] || {})[n] || {}).comment || '', a: d.a }; });
+      return { uid: u.uid, name: u.name, cls: u.cls || '', lessons };
+    }).filter(x => Object.keys(x.lessons).length);
+    const stamp = new Date().toISOString().slice(0, 10);
+    const blob = new Blob([JSON.stringify({ kind: 'answers', exported: new Date().toISOString(), lesson: only || 'all', cls: T.cls || 'all', students }, null, 1)], { type: 'application/json' });
+    const a = el('a', { href: URL.createObjectURL(blob), download: `answers_${T.cls || 'all'}_${only ? 'L' + only : 'all'}_${stamp}.json` }); document.body.append(a); a.click(); a.remove();
+    toast(`${students.length} student(s) exported`);
+  };
+  const over = el('input', { type: 'checkbox' });
+  const fin = el('input', { type: 'file', accept: '.json,application/json', style: 'display:none' });
+  fin.onchange = async () => {
+    const f = fin.files[0]; fin.value = ''; if (!f) return;
+    let data; try { data = JSON.parse(await f.text()); } catch (e) { toast('This is not a valid feedback file'); return; }
+    const items = (data.feedback || []).filter(x => x && x.uid && x.n != null && (x.comment || x.level));
+    const known = new Set(T.users.map(u => u.uid));
+    const todo = items.filter(x => known.has(x.uid) && (over.checked || !(((T.feedback[x.uid] || {})[String(x.n)] || {}).comment)));
+    const skipped = items.length - todo.length;
+    if (!todo.length) { toast(items.length ? 'Nothing to import — all these students already have feedback (tick “Replace existing”)' : 'No feedback found in the file'); return; }
+    const sample = todo.slice(0, 3).map(x => { const u = T.users.find(v => v.uid === x.uid); return `<b>${esc(u.name)} · L${esc(String(x.n))}</b>${x.level ? ' (' + esc(x.level) + ')' : ''}: ${esc((x.comment || '').length > 160 ? x.comment.slice(0, 160) + '…' : x.comment || '')}`; }).join('<br><br>');
+    if (!(await confirmBox(`Import <b>${todo.length}</b> feedback comment(s)?${skipped ? `<br>${skipped} skipped (feedback already exists or student not found).` : ''}<br><br>${sample}`, 'Import', 'Cancel'))) return;
+    let ok = 0;
+    for (const x of todo) { try { await Backend.setFeedback(x.uid, String(x.n), { level: x.level || '', comment: x.comment || '' }); ok++; } catch (e) { console.warn(e); } }
+    toast(`${ok} comment(s) saved — students see them now`);
+  };
+  w.append(el('div', { class: 'card' }, el('h3', { text: 'Feedback with an assistant' }),
+    el('p', { class: 'small', html: '<b>1.</b> Choose a lesson (or all) and download the answers file — it contains the answers of the students in the class selected above. <b>2.</b> Give the file to your assistant; it returns a feedback file. <b>3.</b> Import it: you see the number of comments and examples before anything is saved. Existing comments are kept unless you tick “Replace existing”. You can still edit any comment in the Progress tab.' }),
+    el('div', { style: 'display:flex;gap:10px;flex-wrap:wrap;align-items:center' }, lsel,
+      el('button', { class: 'btn', type: 'button', text: 'Download answers (JSON)', onclick: exportAnswers }),
+      el('button', { class: 'btn or', type: 'button', text: 'Import feedback (JSON)', onclick: () => fin.click() }),
+      el('label', { class: 'chk small' }, over, 'Replace existing comments'), fin)));
 }
 function download(name, text) {
   const a = el('a', { href: URL.createObjectURL(new Blob(['﻿' + text], { type: 'text/csv;charset=utf-8' })), download: name });
@@ -1610,7 +1684,11 @@ async function boot() {
     app.innerHTML = '<div class="login"><div class="box"><span class="spinner"></span> Loading your work…</div></div>';
     try { S.progress = await Backend.loadMyProgress(); } catch (e) { console.error(e); S.progress = {}; }
     let first = true;
-    S.unsub.push(Backend.watchConfig(c => { S.config = { schedule: {}, closed: [], ...(c || {}) }; if (!first && !S.cur) route(); }));
+    S.unsub.push(Backend.watchConfig(c => {
+      S.config = { schedule: {}, closed: [], ...(c || {}) };
+      if (u.isTeacher && !S.config.openAt && !S.accessSynced) { S.accessSynced = true; Backend.setConfig(accessPatch({ ...S.config.schedule }, { ...(S.config.access || {}) })).catch(e => console.warn(e)); }
+      if (!first && !S.cur) route();
+    }));
     S.unsub.push(Backend.watchMyFeedback(f => { S.feedback = f || {}; if (!first && !S.cur) route(); }));
     if (u.isTeacher) teacherStart();
     first = false;
